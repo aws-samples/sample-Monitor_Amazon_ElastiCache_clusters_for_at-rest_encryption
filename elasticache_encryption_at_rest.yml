@@ -1,0 +1,348 @@
+# (c) 2018 Amazon Web Services, Inc. or its affiliates. All Rights Reserved. This AWS Content
+# is provided subject to the terms of the AWS Customer Agreement available at
+# https://aws.amazon.com/agreement/ or other written agreement between Customer
+# and Amazon Web Services, Inc. 
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Security Control: ElastiCache Encryption At Rest Monitoring (Updated 2025)'
+
+###
+### CloudFormation Interface Metadata
+###
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Security Control Setup
+        Parameters:
+          - pLambdaZipBucket
+          - pLambdaZipKey
+          - pNotificationEmail
+      - Label:
+          default: Security Control Options
+        Parameters:
+          - pLoggingLevel
+          - pReservedConcurrency
+    ParameterLabels:
+      pLambdaZipBucket:
+        default: S3 Bucket
+      pLambdaZipKey:
+        default: S3 Key
+      pNotificationEmail:
+        default: Notification email
+      pLoggingLevel:
+        default: Lambda Logging level
+      pReservedConcurrency:
+        default: Reserved Concurrency
+
+###
+### Template input parameters
+###
+
+Parameters:
+  pLambdaZipBucket:
+    Type: String
+    AllowedPattern: ^(?!-)[a-z0-9-]*(?<!-)$
+    Description: Name of the Security Control zip bucket
+    MinLength: 3
+    MaxLength: 63
+  pLambdaZipKey:
+    Type: String
+    AllowedPattern: ^.+\.zip$
+    Description: The Security Control zip file key (e.g. functions/security-control.zip)
+  pLoggingLevel:
+    Type: String
+    Default: INFO
+    Description: Sets the logging level of your security control's Lambda function
+    AllowedValues:
+      - ERROR
+      - WARNING
+      - INFO
+      - DEBUG
+  pNotificationEmail:
+    Type: String
+    AllowedPattern: ^(.+)@(.+)$
+    Default: example@example.com
+    Description: Email address to alert of any security control violations
+  pReservedConcurrency:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+    Description: Reserved concurrency for the Lambda function
+
+###
+### Template Resources
+###
+
+Resources:
+
+  # KMS Key for SNS Topic Encryption
+  rSNSEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for SNS topic encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: Allow SNS Service
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: logs.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:Encrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:CreateGrant
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*
+
+  # KMS Key Alias
+  rSNSEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${AWS::StackName}-sns-encryption
+      TargetKeyId: !Ref rSNSEncryptionKey
+
+  # Managed IAM Policy for Lambda
+  rLambdaManagedPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AWS::StackName}-LambdaPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudWatchLogsPermissions
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-*
+          - Sid: SNSPublishPermissions
+            Effect: Allow
+            Action:
+              - sns:Publish
+            Resource: !Ref rNotifyTopicSNS
+          - Sid: KMSPermissions
+            Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: !GetAtt rSNSEncryptionKey.Arn
+          - Sid: SQSPermissions
+            Effect: Allow
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt rDLQ.Arn
+
+  # Security Control IAM Role with least privilege
+  rLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-LambdaRole
+      ManagedPolicyArns:
+        - !Ref rLambdaManagedPolicy
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+  # CloudWatch Log Group with retention
+  rLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-LambdaFunction
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt rSNSEncryptionKey.Arn
+
+  # Security Control evaluation function
+  rLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - rLambdaRole
+      - rLambdaLogGroup
+    Properties:
+      Role: !GetAtt rLambdaRole.Arn
+      FunctionName: !Sub ${AWS::StackName}-LambdaFunction
+      Runtime: python3.14
+      Architectures:
+        - x86_64
+      Tags:
+        - Key: Name
+          Value: !Sub Lambda function - ${AWS::StackName}
+        - Key: Purpose
+          Value: ElastiCache Encryption Monitoring
+      Timeout: 60
+      MemorySize: 256
+      ReservedConcurrentExecutions: !Ref pReservedConcurrency
+      DeadLetterConfig:
+        TargetArn: !GetAtt rDLQ.Arn
+      Environment:
+        Variables:
+          OUTBOUND_TOPIC_ARN: !Ref rNotifyTopicSNS
+          LOGGING_LEVEL: !Ref pLoggingLevel
+      KmsKeyArn: !GetAtt rSNSEncryptionKey.Arn
+      Handler: index.lambda_handler
+      Code:
+        S3Bucket: !Ref pLambdaZipBucket
+        S3Key: !Ref pLambdaZipKey
+
+  # Dead Letter Queue for failed invocations
+  rDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-DLQ
+      MessageRetentionPeriod: 1209600 # 14 days
+      KmsMasterKeyId: !Ref rSNSEncryptionKey
+
+  # SQS Policy to enforce SSL-only access
+  rDLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref rDLQ
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: sqs:*
+            Resource: !GetAtt rDLQ.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # EventBridge rule to trigger evaluation (replaces CloudWatch Events)
+  rEventBridgeRule:
+    Type: AWS::Events::Rule
+    DependsOn: rLambdaFunction
+    Properties:
+      Name: !Sub ${AWS::StackName}-ElastiCacheRule
+      Description: Monitors ElastiCache CreateReplicationGroup API calls
+      EventPattern:
+        source:
+          - aws.elasticache
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - elasticache.amazonaws.com
+          eventName:
+            - CreateReplicationGroup
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt rLambdaFunction.Arn
+          Id: !Sub ${AWS::StackName}-LambdaTarget
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+          DeadLetterConfig:
+            Arn: !GetAtt rDLQ.Arn
+
+  # Lambda permission - EventBridge can trigger evaluation
+  rLambdaPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: rLambdaFunction
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt rLambdaFunction.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt rEventBridgeRule.Arn
+
+  # Encrypted SNS topic for notifications
+  rNotifyTopicSNS:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${AWS::StackName}-Notifications
+      DisplayName: ElastiCache Encryption Compliance Notifications
+      KmsMasterKeyId: !Ref rSNSEncryptionKey
+      Subscription:
+        - Endpoint: !Ref pNotificationEmail
+          Protocol: email
+
+  # CloudWatch Alarm for Lambda errors
+  rLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-LambdaErrors
+      AlarmDescription: Alarm for Lambda function errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref rLambdaFunction
+      AlarmActions:
+        - !Ref rNotifyTopicSNS
+
+  # CloudWatch Alarm for DLQ messages
+  rDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-DLQMessages
+      AlarmDescription: Alarm for messages in Dead Letter Queue
+      MetricName: ApproximateNumberOfVisibleMessages
+      Namespace: AWS/SQS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt rDLQ.QueueName
+      AlarmActions:
+        - !Ref rNotifyTopicSNS
+
+###
+### Outputs
+###
+
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt rLambdaFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-LambdaArn
+
+  SNSTopicArn:
+    Description: ARN of the SNS notification topic
+    Value: !Ref rNotifyTopicSNS
+    Export:
+      Name: !Sub ${AWS::StackName}-SNSTopicArn
+
+  EventBridgeRuleArn:
+    Description: ARN of the EventBridge rule
+    Value: !GetAtt rEventBridgeRule.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-EventRuleArn
