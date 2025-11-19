@@ -8,7 +8,7 @@ agreement between Customer and Amazon Web Services, Inc.
 
 Security Control: ElastiCache - Encryption at rest
 Description:  Checks for encryption at rest being enabled on ElastiCache (Redis)
-Services: ElastiCache, Cloudwatch, Lambda
+Services: ElastiCache, EventBridge, Lambda, SNS
 
 Runtime: Python 3.14
 Last Modified: 10/11/2025
