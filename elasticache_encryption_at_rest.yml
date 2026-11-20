@@ -1,10 +1,8 @@
-# (c) 2018 Amazon Web Services, Inc. or its affiliates. All Rights Reserved. This AWS Content
-# is provided subject to the terms of the AWS Customer Agreement available at
-# https://aws.amazon.com/agreement/ or other written agreement between Customer
-# and Amazon Web Services, Inc. 
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
 
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Security Control: ElastiCache Encryption At Rest Monitoring (Updated 2025)'
+Description: 'Sample security control: alerts on new Amazon ElastiCache replication groups created without encryption at rest (not for production use without review)'
 
 ###
 ### CloudFormation Interface Metadata
@@ -62,8 +60,9 @@ Parameters:
       - DEBUG
   pNotificationEmail:
     Type: String
-    AllowedPattern: ^(.+)@(.+)$
-    Default: example@example.com
+    # No default, so the stack cannot be deployed with an address that never confirms
+    AllowedPattern: ^[^@\s]+@[^@\s]+\.[^@\s]+$
+    ConstraintDescription: Must be a valid email address
     Description: Email address to alert of any security control violations
   pReservedConcurrency:
     Type: Number
@@ -87,35 +86,85 @@ Resources:
       KeyPolicy:
         Version: '2012-10-17'
         Statement:
-          - Sid: Enable IAM User Permissions
+          # Delegate key administration and usage to IAM in this account with an
+          # explicit action list instead of kms:*. IAM policies (for example the
+          # Lambda role's KMSPermissions statement) still control who can use the key.
+          - Sid: AllowAccountKeyAdministration
             Effect: Allow
             Principal:
               AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
-            Action: kms:*
+            Action:
+              - kms:Create*
+              - kms:Describe*
+              - kms:Enable*
+              - kms:List*
+              - kms:Put*
+              - kms:Update*
+              - kms:Revoke*
+              - kms:Disable*
+              - kms:Get*
+              - kms:Delete*
+              - kms:TagResource
+              - kms:UntagResource
+              - kms:ScheduleKeyDeletion
+              - kms:CancelKeyDeletion
+              - kms:RotateKeyOnDemand
             Resource: '*'
-          - Sid: Allow SNS Service
+          - Sid: AllowAccountKeyUsage
             Effect: Allow
             Principal:
-              Service: sns.amazonaws.com
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
             Action:
-              - kms:Decrypt
-              - kms:GenerateDataKey
-            Resource: '*'
-          - Sid: Allow CloudWatch Logs
-            Effect: Allow
-            Principal:
-              Service: logs.amazonaws.com
-            Action:
-              - kms:Decrypt
               - kms:Encrypt
+              - kms:Decrypt
               - kms:ReEncrypt*
               - kms:GenerateDataKey*
-              - kms:CreateGrant
+            Resource: '*'
+          # CloudWatch alarms publish to the KMS-encrypted SNS topic.
+          # Scoped by the encryption context SNS sets, so the key can only be
+          # used for this stack's topic.
+          - Sid: AllowCloudWatchAlarmsToUseKey
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:EncryptionContext:aws:sns:topicArn: !Sub arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-Notifications
+          # EventBridge sends undeliverable events to the KMS-encrypted DLQ.
+          # Scoped by the encryption context SQS sets, so the key can only be
+          # used for this stack's queue.
+          - Sid: AllowEventBridgeToUseKey
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:EncryptionContext:aws:sqs:arn: !Sub arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-DLQ
+          # CloudWatch Logs encrypts this function's log group only. The exact
+          # log group ARN in the encryption context stops other log groups in
+          # the account from being associated with this key.
+          - Sid: AllowCloudWatchLogsForFunctionLogGroup
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
               - kms:DescribeKey
             Resource: '*'
             Condition:
-              ArnLike:
-                kms:EncryptionContext:aws:logs:arn: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*
+              ArnEquals:
+                kms:EncryptionContext:aws:logs:arn: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-LambdaFunction
 
   # KMS Key Alias
   rSNSEncryptionKeyAlias:
@@ -134,11 +183,15 @@ Resources:
         Statement:
           - Sid: CloudWatchLogsPermissions
             Effect: Allow
+            # Log group is created by this template, so only stream/write access is needed
             Action:
-              - logs:CreateLogGroup
               - logs:CreateLogStream
               - logs:PutLogEvents
-            Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-*
+            # GetAtt Arn already returns arn:...:log-group:<name>:* which scopes
+            # access to this function's log group and its streams only. Do not
+            # append ":log-stream:*"; that produces an ARN no stream matches and
+            # the function silently stops writing logs.
+            Resource: !GetAtt rLambdaLogGroup.Arn
           - Sid: SNSPublishPermissions
             Effect: Allow
             Action:
@@ -184,9 +237,23 @@ Resources:
   # Security Control evaluation function
   rLambdaFunction:
     Type: AWS::Lambda::Function
-    DependsOn:
-      - rLambdaRole
-      - rLambdaLogGroup
+    DependsOn: rLambdaLogGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: >-
+              The function only reads the EventBridge event payload and calls the
+              regional SNS API. It does not access any VPC resources, so VPC
+              attachment adds NAT or VPC endpoint cost without reducing exposure.
+              Deploy into a VPC with an SNS interface endpoint if your policy requires it.
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: Function does not access VPC resources (see CKV_AWS_117 justification)
+      guard:
+        SuppressedRules:
+          - LAMBDA_INSIDE_VPC
     Properties:
       Role: !GetAtt rLambdaRole.Arn
       FunctionName: !Sub ${AWS::StackName}-LambdaFunction
@@ -238,11 +305,20 @@ Resources:
             Condition:
               Bool:
                 aws:SecureTransport: 'false'
+          # Allow only this stack's EventBridge rule to write failed events to the DLQ
+          - Sid: AllowEventBridgeRuleDLQ
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt rDLQ.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt rEventBridgeRule.Arn
 
   # EventBridge rule to trigger evaluation (replaces CloudWatch Events)
   rEventBridgeRule:
     Type: AWS::Events::Rule
-    DependsOn: rLambdaFunction
     Properties:
       Name: !Sub ${AWS::StackName}-ElastiCacheRule
       Description: Monitors ElastiCache CreateReplicationGroup API calls
@@ -268,11 +344,11 @@ Resources:
   # Lambda permission - EventBridge can trigger evaluation
   rLambdaPermission:
     Type: AWS::Lambda::Permission
-    DependsOn: rLambdaFunction
     Properties:
       Action: lambda:InvokeFunction
       FunctionName: !GetAtt rLambdaFunction.Arn
       Principal: events.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
       SourceArn: !GetAtt rEventBridgeRule.Arn
 
   # Encrypted SNS topic for notifications
@@ -285,6 +361,35 @@ Resources:
       Subscription:
         - Endpoint: !Ref pNotificationEmail
           Protocol: email
+
+  # SNS topic policy: enforce TLS and limit service publishers to this account's alarms
+  rNotifyTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref rNotifyTopicSNS
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: sns:Publish
+            Resource: !Ref rNotifyTopicSNS
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+          - Sid: AllowCloudWatchAlarmsPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref rNotifyTopicSNS
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-*
 
   # CloudWatch Alarm for Lambda errors
   rLambdaErrorAlarm:
@@ -299,6 +404,7 @@ Resources:
       EvaluationPeriods: 1
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
       Dimensions:
         - Name: FunctionName
           Value: !Ref rLambdaFunction
@@ -311,9 +417,10 @@ Resources:
     Properties:
       AlarmName: !Sub ${AWS::StackName}-DLQMessages
       AlarmDescription: Alarm for messages in Dead Letter Queue
-      MetricName: ApproximateNumberOfVisibleMessages
+      MetricName: ApproximateNumberOfMessagesVisible
       Namespace: AWS/SQS
-      Statistic: Average
+      Statistic: Maximum
+      TreatMissingData: notBreaching
       Period: 300
       EvaluationPeriods: 1
       Threshold: 1

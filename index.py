@@ -1,17 +1,15 @@
 """
-AWS Disclaimer.
+Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+SPDX-License-Identifier: MIT-0
 
-(c) 2018 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
-This AWS Content is provided subject to the terms of the AWS Customer
-Agreement available at https://aws.amazon.com/agreement/ or other written
-agreement between Customer and Amazon Web Services, Inc.
-
-Security Control: ElastiCache - Encryption at rest
-Description:  Checks for encryption at rest being enabled on ElastiCache (Redis)
-Services: ElastiCache, EventBridge, Lambda, SNS
+Sample security control: Amazon ElastiCache encryption at rest
+Description: Evaluates new Amazon ElastiCache replication groups
+(CreateReplicationGroup API calls delivered by AWS CloudTrail) and reports any
+created without encryption at rest.
+Services: Amazon ElastiCache, AWS CloudTrail, Amazon EventBridge, AWS Lambda,
+Amazon Simple Notification Service (Amazon SNS), Amazon Simple Queue Service (Amazon SQS)
 
 Runtime: Python 3.14
-Last Modified: 10/11/2025
 """
 
 import json
@@ -117,7 +115,7 @@ def check_encryption_status(event: Dict[str, Any]) -> Optional[str]:
         event: Lambda event payload
         
     Returns:
-        "VIOLATION" if encryption is disabled, None if compliant or not supported
+        "VIOLATION" if encryption is disabled or not reported, None if enabled
     """
     try:
         response_elements = event['detail']['responseElements']
@@ -125,10 +123,11 @@ def check_encryption_status(event: Dict[str, Any]) -> Optional[str]:
         logger.error(f"Invalid event structure: {str(e)}")
         raise ValueError("Invalid event structure")
     
-    # Check if at-rest encryption is supported for this engine version
+    # Fail closed: if the field is absent (for example an engine version that
+    # cannot encrypt at rest), the replication group is not encrypted at rest.
     if 'atRestEncryptionEnabled' not in response_elements:
-        logger.info("At-rest encryption feature not supported for this engine version")
-        return None
+        logger.warning("atRestEncryptionEnabled not present in event - reporting as non-compliant")
+        return "VIOLATION"
     
     encryption_enabled = response_elements.get('atRestEncryptionEnabled', False)
     
@@ -253,24 +252,20 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if violation_status == "VIOLATION":
             # Create and send violation notification
             message = create_violation_message(event)
-            success = send_notification(message, topic_arn, context)
-            
-            if success:
-                return {
-                    'statusCode': 200,
-                    'body': json.dumps({
-                        'status': 'violation_reported',
-                        'message': 'Encryption violation detected and notification sent'
-                    })
-                }
-            else:
-                return {
-                    'statusCode': 500,
-                    'body': json.dumps({
-                        'status': 'error',
-                        'message': 'Violation detected but notification failed'
-                    })
-                }
+            if not send_notification(message, topic_arn, context):
+                # Raise instead of returning an error response. For asynchronous
+                # (EventBridge) invocations, a returned value counts as success, so
+                # raising is what triggers Lambda retries, the function DLQ, and
+                # the Errors alarm.
+                raise RuntimeError("Violation detected but SNS notification failed")
+
+            return {
+                'statusCode': 200,
+                'body': json.dumps({
+                    'status': 'violation_reported',
+                    'message': 'Encryption violation detected and notification sent'
+                })
+            }
         else:
             return {
                 'statusCode': 200,
@@ -281,21 +276,16 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             }
             
     except ValueError as e:
-        logger.error(f"Validation error: {str(e)}")
+        # Malformed or non-applicable events (for example a failed
+        # CreateReplicationGroup call, which has no responseElements) are not
+        # retried. Retrying would not change the outcome.
+        logger.error("Validation error: %s", e)
         return {
             'statusCode': 400,
             'body': json.dumps({
                 'status': 'error',
-                'message': f'Invalid input: {str(e)}'
+                'message': 'Invalid input'
             })
         }
-        
-    except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
-        return {
-            'statusCode': 500,
-            'body': json.dumps({
-                'status': 'error',
-                'message': 'Internal server error'
-            })
-        }
+    # Any other exception propagates so Lambda records an error, retries, and
+    # sends the event to the DLQ.
